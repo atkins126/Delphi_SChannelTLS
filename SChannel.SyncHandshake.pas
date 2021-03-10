@@ -49,7 +49,7 @@ type
 // Synchronously perform full handshake process including communication with server.
 procedure PerformClientHandshake(var SessionData: TSessionData; const ServerName: string;
   LogFn: TLogFn; Data: Pointer; SendFn: TSendFn; RecvFn: TRecvFn;
-  out hContext: CtxtHandle);
+  out hContext: CtxtHandle; out ExtraData: TBytes);
 
 {$ENDIF MSWINDOWS}
 
@@ -77,10 +77,11 @@ end;
 //   @param SendFn - data send callback
 //   @param RecvFn - data read callback
 //   @param hContext - [OUT] receives current session context
+//   @param ExtraData - [OUT] receives extra data sent by server to be decrypted
 // @raises ESSPIError on error
 procedure PerformClientHandshake(var SessionData: TSessionData; const ServerName: string;
   LogFn: TLogFn; Data: Pointer; SendFn: TSendFn; RecvFn: TRecvFn;
-  out hContext: CtxtHandle);
+  out hContext: CtxtHandle; out ExtraData: TBytes);
 var
   HandShakeData: THandShakeData;
   cbData: Integer;
@@ -167,8 +168,12 @@ begin
         end
         else if HandShakeData.Stage = hssReadSrvHelloOK then
         begin
+          if HandShakeData.cbIoBuffer > 0 then
+            LogFn(Format(S_Msg_HShExtraData, [HandShakeData.cbIoBuffer]));
           LogFn(S_Msg_Established);
-          HandShakeData.Stage := hssDone;
+          HandShakeData.Stage := hssDone; // useless
+          // Return extra data if any received. 0-length will work as well
+          ExtraData := Copy(HandShakeData.IoBuffer, 0, HandShakeData.cbIoBuffer);
           Break;
         end;
       end;

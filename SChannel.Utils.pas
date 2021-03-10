@@ -104,6 +104,13 @@ type
   end;
   PSessionData = ^TSessionData;
 
+  // Trivial data storage
+  TBuffer = record
+    Data: TBytes;          // Buffer for data
+    DataStartIdx: Integer; // Index in buffer the unprocessed data starts from
+    DataLen: Cardinal;     // Length of unprocessed data
+  end;
+
   // Interface with session data for sharing credentials
   ISharedSessionData = interface
     // Return pointer to `TSessionData` record
@@ -215,7 +222,9 @@ procedure InitBuffers(const hContext: CtxtHandle; out pbIoBuffer: TBytes;
 procedure EncryptData(const hContext: CtxtHandle; const Sizes: SecPkgContext_StreamSizes;
   pbMessage: PByte; cbMessage: DWORD; pbIoBuffer: PByte; pbIoBufferLength: DWORD;
   out cbWritten: DWORD);
-// Decrypt data received from server
+// Decrypt data received from server. If input data is not processed completely,
+// unprocessed chunk is copied to beginning of buffer. Thus subsequent call to
+// Recv could just receive to @Buffer[DataLength]
 //   @param hContext - current session context
 //   @param Sizes - current session sizes
 //   @param pbIoBuffer - input encrypted data to decrypt
@@ -230,7 +239,7 @@ procedure EncryptData(const hContext: CtxtHandle; const Sizes: SecPkgContext_Str
 //   * `SEC_E_OK` - message processed fully                                    \
 //   * `SEC_E_INCOMPLETE_MESSAGE` - need more data                             \
 //   * `SEC_I_RENEGOTIATE` - server wants to perform another handshake sequence
-// @raises ESSPIError on error
+// @raises ESSPIError on error or if Result is not one of above mentioned values
 function DecryptData(const hContext: CtxtHandle; const Sizes: SecPkgContext_StreamSizes;
   pbIoBuffer: PByte; var cbEncData: DWORD;
   pbDecData: PByte; cbDecDataLength: DWORD; out cbWritten: DWORD): SECURITY_STATUS;
@@ -248,23 +257,22 @@ function WinVerifyTrustErrorStr(Status: DWORD): string;
 // This function only checks if parameter is one of these two values.
 function IsWinHandshakeBug(scRet: SECURITY_STATUS): Boolean;
 
-// Messages that could be written to log by various implementations
+// Messages that could be written to log by various implementations. None of these
+// are used in this unit
 const
   S_Msg_Received = 'Received %d bytes of encrypted data / %d bytes of payload';
   S_Msg_SessionClosed = 'Server closed the session [SEC_I_CONTEXT_EXPIRED]';
   S_Msg_Renegotiate = 'Server requested renegotiate';
-  S_Err_DecryptMessageUnexpRes = 'DecryptMessage unexpected result %s';
   S_Msg_Sending = 'Sending %d bytes of payload / %d bytes encrypted';
-  S_Err_Sending = 'Error sending payload to server: "%s"';
   S_Msg_StartingTLS = 'Starting TLS handshake';
-  S_Msg_HandshakeTDAErr = 'Handshake - ! error [%d] in TriggerDataAvailable';
   S_Msg_HShStageW1Success = 'Handshake @W1 - %d bytes sent';
   S_Msg_HShStageW1Fail = 'Handshake @W1 - ! error sending data';
-  S_Msg_HShStageRFail = 'Handshake @R - no data received or error receiving [%d]';
+  S_Msg_HShStageRFail = 'Handshake @R - no data received or error receiving';
   S_Msg_HShStageRSuccess = 'Handshake @R - %d bytes received';
   S_Msg_HandshakeBug = 'Handshake bug: "%s", retrying';
   S_Msg_HShStageW2Success = 'Handshake @W2 - %d bytes sent';
   S_Msg_HShStageW2Fail = 'Handshake @W2 - ! error sending data';
+  S_Msg_HShExtraData = 'Handshake: got "%d" bytes of extra data';
   S_Msg_Established = 'Handshake established';
   S_Msg_SrvCredsAuth = 'Server credentials authenticated';
   S_Msg_CredsInited = 'Credentials initialized';
@@ -486,7 +494,7 @@ procedure LoadSecurityLibrary;
 begin
   g_pSSPI := InitSecurityInterface;
   if g_pSSPI = nil then
-    raise ErrWinAPI('at LoadSecurityLibrary reading security interface', 'InitSecurityInterface');
+    raise ErrWinAPI('@ LoadSecurityLibrary', 'InitSecurityInterface');
 end;
 
 procedure CreateCredentials(const User: string; out hCreds: CredHandle; var SchannelCred: SCHANNEL_CRED);
@@ -512,7 +520,7 @@ begin
                                                nil);                                 // pPrevCertContext
 
     if pCertContext = nil then
-      raise ErrWinAPI('at CreateCredentials', 'CertFindCertificateInStore');
+      raise ErrWinAPI('@ CreateCredentials', 'CertFindCertificateInStore');
   end
   else
     pCertContext := nil;
@@ -567,7 +575,7 @@ begin
     CertFreeCertificateContext(pCertContext);
 
   if Status <> SEC_E_OK then
-    raise ErrSecStatus('at CreateCredentials', 'AcquireCredentialsHandle', Status);
+    raise ErrSecStatus('@ CreateCredentials', 'AcquireCredentialsHandle', Status);
 end;
 
 procedure Init;
@@ -580,7 +588,7 @@ begin
   begin
     hMYCertStore := CertOpenSystemStore(0, 'MY');
     if hMYCertStore = nil then
-      raise ErrWinAPI('at Init', 'CertOpenSystemStore');
+      raise ErrWinAPI('@ Init', 'CertOpenSystemStore');
   end;
 end;
 
@@ -629,7 +637,7 @@ begin
   // Read list of trusted issuers from schannel.
   Status := g_pSSPI.QueryContextAttributesW(@hContext, SECPKG_ATTR_ISSUER_LIST_EX, @IssuerListInfo);
   if Status <> SEC_E_OK then
-    raise ErrSecStatus('at GetNewClientCredentials querying issuer list info', 'QueryContextAttributesW', Status);
+    raise ErrSecStatus('@ GetNewClientCredentials', 'QueryContextAttributesW', Status);
 
   // Enumerate the client certificates.
   FindByIssuerPara := Default(CERT_CHAIN_FIND_BY_ISSUER_PARA);
@@ -718,7 +726,8 @@ end;
        - cbIoBuffer - size of data in buffer
 
      *Output data*:
-       - cbIoBuffer - length of unprocessed data in input buffer
+       - IoBuffer - buffer with unprocessed data from server
+       - cbIoBuffer - length of unprocessed data from server
        - OutBuffers - array with single item that must be finally disposed
          with `g_pSSPI.FreeContextBuffer` (hssReadSrvHelloContNeed, hssReadSrvHelloOK)
 
@@ -735,8 +744,10 @@ function DoClientHandshake(var SessionData: TSessionData; var HandShakeData: THa
   begin
     if InBuffer.BufferType = SECBUFFER_EXTRA then
     begin
-      MoveMemory(HandShakeData.IoBuffer,
-        PByte(HandShakeData.IoBuffer) + (HandShakeData.cbIoBuffer - InBuffer.cbBuffer), InBuffer.cbBuffer);
+      Move(
+        (PByte(HandShakeData.IoBuffer) + (HandShakeData.cbIoBuffer - InBuffer.cbBuffer))^,
+        Pointer(HandShakeData.IoBuffer)^,
+        InBuffer.cbBuffer);
       HandShakeData.cbIoBuffer := InBuffer.cbBuffer;
     end
     else
@@ -781,9 +792,9 @@ begin
                                                      @tsExpiry);
 
         if Result <> SEC_I_CONTINUE_NEEDED then
-          raise ErrSecStatus('at DoClientHandshake on client hello', 'InitializeSecurityContext', Result);
+          raise ErrSecStatus('@ DoClientHandshake @ client hello', 'InitializeSecurityContext', Result);
         if (HandShakeData.OutBuffers[0].cbBuffer = 0) or (HandShakeData.OutBuffers[0].pvBuffer = nil) then
-          raise Error('Error at DoClientHandshake on client hello: InitializeSecurityContext generated empty buffer');
+          raise Error('Error @ DoClientHandshake @ client hello: InitializeSecurityContext generated empty buffer');
 
         HandShakeData.Stage := hssSendCliHello;
       end;
@@ -849,7 +860,7 @@ begin
 
         // Check for fatal error.
         if Failed(Result) then
-          raise ErrSecStatus('at DoClientHandshake on server hello', 'InitializeSecurityContext', Result);
+          raise ErrSecStatus('@ DoClientHandshake @ server hello', 'InitializeSecurityContext', Result);
 
         case Result of
           // SEC_I_CONTINUE_NEEDED:
@@ -889,7 +900,7 @@ begin
               HandShakeData.Stage := hssReadSrvHelloOK;
             end;
           else  // SEC_I_COMPLETE_AND_CONTINUE, SEC_I_COMPLETE_NEEDED
-            raise ErrSecStatus('at DoClientHandshake on server hello - don''t know how to handle this', 'InitializeSecurityContext', Result);
+            raise ErrSecStatus('@ DoClientHandshake @ server hello - don''t know how to handle this', 'InitializeSecurityContext', Result);
         end; // case
 
         HandleBuffers(InBuffers[1]);
@@ -921,7 +932,7 @@ begin
 
   Status := g_pSSPI.ApplyControlToken(@hContext, @OutBufferDesc);
   if Failed(Status) then
-    raise ErrSecStatus('at GetShutdownData', 'ApplyControlToken', Status);
+    raise ErrSecStatus('@ GetShutdownData', 'ApplyControlToken', Status);
 
   // Build an SSL close notify message.
   dwSSPIFlags :=
@@ -951,7 +962,7 @@ begin
   if Failed(Status) then
   begin
     g_pSSPI.FreeContextBuffer(OutBuffers[0].pvBuffer); // Free output buffer.
-    raise ErrSecStatus('at GetShutdownData', 'InitializeSecurityContext', Status);
+    raise ErrSecStatus('@ GetShutdownData', 'InitializeSecurityContext', Status);
   end;
 
   OutBuffer := OutBuffers[0];
@@ -975,7 +986,7 @@ begin
   pChainContext := nil;
 
   if pServerCert = nil then
-    raise Error('Error at VerifyServerCertificate - server cert is NULL');
+    raise Error('Error @ VerifyServerCertificate - server cert is NULL');
 
   // Build certificate chain.
   try
@@ -993,7 +1004,7 @@ begin
                                    0,
                                    nil,
                                    @pChainContext) then
-      raise ErrWinAPI('at VerifyServerCertificate getting cert chain', 'CertGetCertificateChain');
+      raise ErrWinAPI('@ VerifyServerCertificate', 'CertGetCertificateChain');
 
     // Validate certificate chain.
     polHttps := Default(HTTPSPolicyCallbackData);
@@ -1013,10 +1024,10 @@ begin
                                             pChainContext,
                                             @PolicyPara,
                                             @PolicyStatus) then
-      raise ErrWinAPI('at VerifyServerCertificate verifying cert chain', 'CertVerifyCertificateChainPolicy');
+      raise ErrWinAPI('@ VerifyServerCertificate', 'CertVerifyCertificateChainPolicy');
 
     if PolicyStatus.dwError <> NO_ERROR then
-      raise Error('Error at VerifyServerCertificate verifying cert chain calling method "CertVerifyCertificateChainPolicy": %s',
+      raise Error('Error @ VerifyServerCertificate verifying cert chain calling method "CertVerifyCertificateChainPolicy": %s',
         [WinVerifyTrustErrorStr(PolicyStatus.dwError)]);
   finally
     if pChainContext <> nil then
@@ -1033,7 +1044,7 @@ begin
   // Authenticate server's credentials. Get server's certificate.
   Status := g_pSSPI.QueryContextAttributesW(@hContext, SECPKG_ATTR_REMOTE_CERT_CONTEXT, @pRemoteCertContext);
   if Status <> SEC_E_OK then
-    raise ErrSecStatus('querying remote certificate at CheckServerCert', 'QueryContextAttributesW', Status);
+    raise ErrSecStatus('@ CheckServerCert', 'QueryContextAttributesW', Status);
 
   try
     // Attempt to validate server certificate.
@@ -1060,7 +1071,7 @@ begin
   // Read stream encryption properties.
   scRet := g_pSSPI.QueryContextAttributesW(@hContext, SECPKG_ATTR_STREAM_SIZES, @Sizes);
   if scRet <> SEC_E_OK then
-    raise ErrSecStatus('reading SECPKG_ATTR_STREAM_SIZES at InitBuffers', 'QueryContextAttributesW', scRet);
+    raise ErrSecStatus('@ InitBuffers', 'QueryContextAttributesW', scRet);
   // Create a buffer.
   SetLength(pbIoBuffer, Sizes.cbHeader + Sizes.cbMaximumMessage + Sizes.cbTrailer);
 end;
@@ -1103,7 +1114,7 @@ begin
   Msg.pBuffers    := @Buffers;           // Pointer to array of buffers
   scRet := g_pSSPI.EncryptMessage(@hContext, 0, @Msg, 0); // must contain four SecBuffer structures.
   if Failed(scRet) then
-    raise ErrSecStatus('at EncryptData', 'EncryptMessage', scRet);
+    raise ErrSecStatus('@ EncryptData', 'EncryptMessage', scRet);
 
   // Resulting Buffers: header, data, trailer
   cbWritten := Buffers[0].cbBuffer + Buffers[1].cbBuffer + Buffers[2].cbBuffer;
@@ -1145,12 +1156,12 @@ begin
     Result := g_pSSPI.DecryptMessage(@hContext, @Msg, 0, Dummy);
 
     if Result = SEC_I_CONTEXT_EXPIRED then
-      Break; // Server signalled end of session
+      Break; // Server signaled end of session
 
     if (Result <> SEC_E_OK) and
        (Result <> SEC_E_INCOMPLETE_MESSAGE) and
        (Result <> SEC_I_RENEGOTIATE) then
-      raise ErrSecStatus('at DecryptData - unexpected result', 'DecryptMessage', Result);
+      raise ErrSecStatus('@ DecryptData - unexpected result', 'DecryptMessage', Result);
 
     // After DecryptMessage data is still in the Buffers
     // Buffer with type DATA contains decrypted data
